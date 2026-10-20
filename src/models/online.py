@@ -133,8 +133,17 @@ class OnlineBackbone(SeqRecModel):
         """x_t: (B,) item ids; state: per-layer (B, K, D). -> (logits, new_state, info)."""
         return self._step_vec(self._embed_at(x_t, pos), state, pos, **kw)
 
-    def _step_vec(self, xt, state, pos=None, **kw):
-        """xt: (B, d) already-embedded current input."""
+    def _encode_step(self, xt, state, pos=None, **kw):
+        """Advance one token; return (cur, u, new_state, info) -- WITHOUT scoring.
+
+        The only difference from ``_step_vec`` is that ``score()`` is not called
+        here.  Motivation: at inference time only the **last** position of each
+        sequence needs logits, while ``forward()`` must score every position
+        because supervision is applied per position.  Deferring the scoring to the
+        step where each sequence actually ends cuts the number of full-catalog
+        scorings from B*T to B.  It drops only computation that was being
+        discarded, so the numbers are bit-identical.
+        """
         B = xt.size(0)
         r, g = self.step_coeffs(xt, state[-1], pos)
         cur = xt.unsqueeze(1).expand(B, self.K, self.d_model)     # (B, K, d)
@@ -152,7 +161,16 @@ class OnlineBackbone(SeqRecModel):
             new_state.append(h_new)
         cur = self.ln(cur)                                        # (B, K, d)
         u = self._pool(cur)
-        return self.score(cur, u), new_state, {"r": r, "g": g}
+        return cur, u, new_state, {"r": r, "g": g}
+
+    def _step_vec(self, xt, state, pos=None, **kw):
+        """xt: (B, d) already-embedded input; includes full-catalog scoring.
+
+        Used by ``forward()``, where every position is supervised.  Inference goes
+        through the cheaper path in :meth:`MIRR.final_logits`.
+        """
+        cur, u, new_state, info = self._encode_step(xt, state, pos, **kw)
+        return self.score(cur, u), new_state, info
 
     # ---------------- scoring ---------------- #
     def score(self, H, u):

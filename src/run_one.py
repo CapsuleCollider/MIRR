@@ -124,7 +124,10 @@ def make_parser():
     p.add_argument("--read_cond", type=int, default=1,
                    help="1 = condition the probes on the long-term state")
     p.add_argument("--per_user_alpha", type=int, default=0,
-                   help="1 = sample-dependent fusion weight")
+                   help="0 = one global fusion gate; 1 = sample-dependent shift; "
+                        "2 = batch-standardised sample-dependent re-allocation "
+                        "(centred, so it can only redistribute across users and "
+                        "collapses back to 0 as its strength -> 0)")
     p.add_argument("--route_bias", type=int, default=1,
                    help="1 = let the long-term state bias which interest wins")
     p.add_argument("--bptt", type=int, default=0,

@@ -72,7 +72,8 @@ class MIRR(OnlineBackbone):
         self.read_win = int(read_win)
         self.n_probe = int(read_probes) if self.read_win > 0 else 0
         self.read_cond = bool(read_cond)
-        self.per_user_alpha = bool(per_user_alpha)
+        # 0 = global gate, 1 = naive per-user shift, 2 = batch-standardised per-user
+        self.per_user_alpha = int(per_user_alpha)
         self.route_bias = bool(route_bias) and self.read_win > 0
         self.bptt = int(bptt)
         # A read-time router keeps a single long-term state; slots are the write-time
@@ -117,6 +118,9 @@ class MIRR(OnlineBackbone):
                     nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, 1))
                 nn.init.zeros_(self.alpha_mlp[-1].weight)
                 nn.init.zeros_(self.alpha_mlp[-1].bias)
+            if self.per_user_alpha >= 2:
+                # beta: strength of the standardised per-user re-allocation.
+                self.alpha_beta = nn.Parameter(torch.tensor(0.3))
             if self.route_bias:
                 # W_b: maps u_t into the interest space (Eq. 5).
                 self.interest_bias = nn.Linear(d_model, d_model)
@@ -212,12 +216,37 @@ class MIRR(OnlineBackbone):
         return (L_all + lam * b.unsqueeze(-1)).max(dim=1).values
 
     def _alpha(self, u, U):
-        """Fusion weight a: scalar, or (B, 1) in the per-user variant. Eq. 7-8."""
+        """Fusion weight a: scalar, or (B, 1) in the per-user variants. Eq. 7-8.
+
+        per_user_alpha:
+          0 -> one global gate, sigmoid(logit_alpha)
+          1 -> naive per-user shift, sigmoid(logit_alpha + f([u; ubar]))
+          2 -> batch-standardised re-allocation,
+               sigmoid(logit_alpha + beta * (f - mean f) / std f)
+
+        Why 2 exists: variant 1 lets a small MLP shift the BATCH MEAN of the fusion
+        weight, which short-circuits the global logit_alpha that training already
+        tuned.  On datasets where the global gate is already right, that is pure
+        added variance.  Centring removes the batch-level shift, so 2 only
+        re-allocates the weight ACROSS users and never moves its mean.  Its
+        hypothesis space therefore STRICTLY CONTAINS the global gate (beta -> 0
+        recovers it exactly), i.e. the worst case of 2 is 0, not worse than 0.
+
+        std is detached: with a zero-initialised last layer raw is identically 0 at
+        the start of training, so std(raw) = 0 and d std/dx = (x - mean)/(n*std)
+        = 0/0 = NaN would poison the whole run.  std is only a rescaling constant
+        and needs no gradient.  unbiased=False as well, because a batch of size 1
+        has 0 degrees of freedom and returns NaN.
+        """
         if not self.per_user_alpha:
             return torch.sigmoid(self.logit_alpha)
         ubar = U.mean(dim=1)                                           # (B, d)
-        return torch.sigmoid(self.logit_alpha
-                             + self.alpha_mlp(torch.cat([u, ubar], dim=-1)))
+        raw = self.alpha_mlp(torch.cat([u, ubar], dim=-1))             # (B, 1)
+        if self.per_user_alpha >= 2:
+            sd = torch.nan_to_num(raw.std(unbiased=False).detach(),
+                                  nan=1.0, posinf=1.0).clamp(min=1e-4)
+            raw = (raw - raw.mean().detach()) / sd * self.alpha_beta
+        return torch.sigmoid(self.logit_alpha + raw)
 
     # ------------------------------------------------------------------ #
     # Scoring
@@ -283,8 +312,38 @@ class MIRR(OnlineBackbone):
         return loss_sum, n_tgt, logits_last
 
     def final_logits(self, seq):
-        _, _, last = self.forward(seq)
-        return last
+        """Inference path: score the catalog ONCE, at the last step of each sequence.
+
+        ``forward()`` has to produce (B, n_items) logits at every position because
+        supervision is per-position, but inference keeps only the last one, so T-1
+        scorings are computed and thrown away.  Here we advance the state with
+        ``_encode_step`` and defer ``score()`` to the step at which each sequence
+        actually ends: B scorings instead of B*T.  Bit-identical to
+        ``forward()[2]``, it just stops doing discarded work.
+        """
+        B, T = seq.shape
+        x = self.emb(seq)
+        state = self.init_state(B, seq.device)
+        T_eff = max(int((seq != 0).sum(dim=1).max().item()), 1)
+        last_idx = (seq != 0).sum(dim=1).clamp(min=1) - 1
+        logits_last = torch.zeros(B, self.n_items, device=seq.device)
+        for t in range(T_eff):
+            self._push_win(x[:, t, :], seq[:, t] != 0)
+            cur, u, state, _ = self._encode_step(
+                x[:, t, :], state,
+                pos=torch.full((B,), min(t, self.max_len - 1), device=seq.device))
+            done = (last_idx == t)
+            if done.any():
+                # Score only the sequences that just ended.  The read-time branch
+                # derives several shapes from self._win's batch dim, so the window
+                # must be sliced along with it (absent when read_win == 0).
+                win, wmask = self._win, self._win_mask
+                if win is not None:
+                    self._win, self._win_mask = win[done], wmask[done]
+                logits_last[done] = self.score(cur[done], u[done])
+                if win is not None:
+                    self._win, self._win_mask = win, wmask
+        return logits_last
 
     def step(self, x_t, state, pos=None, **kw):
         """One streaming step: advance the recent window, then the recurrent state."""
